@@ -6,11 +6,12 @@ Projeto da disciplina de Redes de Computadores II — implementação de um sist
 
 ## Visão Geral
 
-O sistema simula um cenário de segurança pública em que sensores detectam ocorrências em diferentes setores e drones são despachados para atendê-las com base em prioridade. A solução é composta por três tipos de módulos independentes que se comunicam via TCP:
+O sistema simula um cenário de segurança pública em que sensores detectam ocorrências em diferentes setores e drones são despachados para atendê-las com base em prioridade. A solução é composta por quatro tipos de módulos independentes que se comunicam via TCP:
 
 - **Broker** — coordena o despacho de drones, mantém a fila de requisições compartilhada e se comunica com os demais brokers para garantir consistência distribuída
-- **Drone** — conecta-se a um broker, aguarda missões e reporta conclusão ou queda
-- **Sensor** — detecta ocorrências aleatórias e as envia ao broker do seu setor
+- **Drone** — conecta-se a um broker disponível, aguarda missões e reporta conclusão ou queda
+- **Sensor** — detecta ocorrências aleatórias e as envia ao broker do seu setor automaticamente
+- **Cliente** — interface manual que substitui o sensor, permitindo ao operador enviar ocorrências escolhendo o tipo e setor
 
 Cada setor (`setor_a`, `setor_b`, `setor_c`) tem seu próprio broker, drone e sensor. Apesar de independentes, todos compartilham uma fila de requisições distribuída, replicada e consistente entre os três brokers.
 
@@ -29,6 +30,8 @@ Sensor A ──► Broker A ◄──── TCP (Ricart-Agrawala) ────�
                                       Broker C ◄── Sensor C
                                          │
                                       Drone C
+
+Cliente (manual) ──► qualquer Broker (via porta 7xxx)
 ```
 
 ### Portas utilizadas
@@ -37,7 +40,7 @@ Sensor A ──► Broker A ◄──── TCP (Ricart-Agrawala) ────�
 |--------|---------|---------|---------|
 | Broker ↔ Broker (Ricart-Agrawala) | 5001 | 5002 | 5003 |
 | Drone → Broker | 6001 | 6002 | 6003 |
-| Sensor → Broker | 7001 | 7002 | 7003 |
+| Sensor / Cliente → Broker | 7001 | 7002 | 7003 |
 
 ---
 
@@ -87,7 +90,7 @@ A fila é replicada em todos os brokers e mantida consistente via broadcast. Cad
 ### Fluxo de uma requisição
 
 ```
-Sensor detecta ocorrência
+Sensor ou Cliente detecta/envia ocorrência
         ↓
 Broker recebe via TCP (porta 7xxx)
         ↓
@@ -134,6 +137,10 @@ Quando um drone desconecta enquanto está em missão ativa, o broker:
 
 Se o drone desconectar sem missão ativa (apenas idle), nenhuma requisição é perdida e o sistema continua normalmente.
 
+### Drone reconecta após queda de broker
+
+O drone tenta se conectar a qualquer broker disponível na lista. Se o broker ao qual estava conectado cair, o drone automaticamente tenta o próximo da lista até encontrar um disponível. Ao reconectar, envia `CADASTRO` e o novo broker registra o drone e faz broadcast para os peers.
+
 ### Falha na comunicação entre brokers
 
 Quando um broker tenta enviar mensagem a um peer e a conexão falha (timeout de 2 segundos), o envio é ignorado silenciosamente. O peer offline simplesmente não recebe o broadcast. Quando esse peer voltar, o sync inicial vai nivelar a fila.
@@ -154,6 +161,7 @@ Toda comunicação entre módulos é feita via JSON sobre TCP.
 | `FILA_SYNC_REQUEST` | Broker → Broker | Broker recém-iniciado pede a fila atual |
 | `FILA_SYNC_RESPONSE` | Broker → Broker | Resposta com a fila completa para merge |
 | `EXECUTE` | Broker → Broker | Pede a outro broker que despache um drone remoto |
+| `BROKER_OFFLINE` | Broker → Broker | Avisa peers que um broker caiu (limpa fila de requisições do broker caído) |
 | `CADASTRO` | Drone → Broker | Drone se registra ao conectar |
 | `DISPATCH` | Broker → Drone | Envia missão ao drone |
 | `CONCLUIDO` | Drone → Broker | Drone informa conclusão da missão |
@@ -169,7 +177,7 @@ Toda comunicação entre módulos é feita via JSON sobre TCP.
 
 ### Localmente (uma máquina, sem Docker)
 
-Abra um terminal por módulo e suba na ordem: brokers → drones → sensores.
+Abra um terminal por módulo e suba na ordem: brokers → drones → sensores (ou cliente).
 
 ```bash
 # Brokers
@@ -182,13 +190,37 @@ python drone.py drone_a1
 python drone.py drone_b1
 python drone.py drone_c1
 
-# Sensores
+# Sensores automáticos
 python sensor.py setor_a
 python sensor.py setor_b
 python sensor.py setor_c
+
+# OU cliente manual (substitui o sensor)
+python cliente.py setor_a
 ```
 
 Os defaults já apontam para `127.0.0.1` — nenhuma variável de ambiente é necessária para rodar localmente.
+
+### Cliente manual
+
+O cliente permite enviar ocorrências manualmente sem depender do sensor automático. É útil para testes controlados.
+
+```bash
+python cliente.py setor_a
+```
+
+```
+Cliente manual — setor: setor_a
+────────────────────────────────────────
+Tipos de ocorrência:
+  1 → averiguacao      (BAIXA)
+  2 → possivel_ataque  (MÉDIA)
+  3 → ataque_concreto  (ALTA)
+  q → sair
+────────────────────────────────────────
+
+Digite o tipo de ocorrência [1/2/3/q]:
+```
 
 ### Em múltiplas máquinas (laboratório)
 
@@ -206,22 +238,30 @@ python drone.py drone_a1
 # Sensor na mesma máquina
 BROKER_A=192.168.1.10:7001 BROKER_B=192.168.1.11:7002 BROKER_C=192.168.1.12:7003 \
 python sensor.py setor_a
+
+# Cliente manual (pode rodar em qualquer máquina)
+BROKER_A=192.168.1.10:7001 BROKER_B=192.168.1.11:7002 BROKER_C=192.168.1.12:7003 \
+python cliente.py setor_b
 ```
 
-> Drones e sensores podem rodar em qualquer máquina da rede — basta apontar as variáveis para os IPs corretos. A porta muda conforme o módulo: `5001–5003` para broker↔broker, `6001–6003` para drones, `7001–7003` para sensores.
+> Drones, sensores e clientes podem rodar em qualquer máquina da rede — basta apontar as variáveis para os IPs corretos. A porta muda conforme o módulo: `5001–5003` para broker↔broker, `6001–6003` para drones, `7001–7003` para sensores e clientes.
 
 ### Com Docker
 
 ```bash
 # Build das imagens
-docker build -t lucasarguerra/redes2-broker:latest ./broker
-docker build -t lucasarguerra/redes2-drone:latest  ./drone
-docker build -t lucasarguerra/redes2-sensor:latest ./sensor
+docker build -t lucasarguerra/redes2-broker:latest  ./broker
+docker build -t lucasarguerra/redes2-drone:latest   ./drone
+docker build -t lucasarguerra/redes2-sensor:latest  ./sensor
+docker build -t lucasarguerra/redes2-cliente:latest ./cliente
+docker build -t lucasarguerra/redes2-testes:latest  ./testes
 
 # Push para o Docker Hub
 docker push lucasarguerra/redes2-broker:latest
 docker push lucasarguerra/redes2-drone:latest
 docker push lucasarguerra/redes2-sensor:latest
+docker push lucasarguerra/redes2-cliente:latest
+docker push lucasarguerra/redes2-testes:latest
 
 # Broker (--network host obrigatório para comunicação entre máquinas físicas)
 docker run -d --network host \
@@ -233,10 +273,15 @@ docker run -d --network host \
   -e BROKER_A=<IP_A>:6001 -e BROKER_B=<IP_B>:6002 -e BROKER_C=<IP_C>:6003 \
   lucasarguerra/redes2-drone:latest python drone.py drone_a1
 
-# Sensor
+# Sensor automático
 docker run -d --network host \
   -e BROKER_A=<IP_A>:7001 -e BROKER_B=<IP_B>:7002 -e BROKER_C=<IP_C>:7003 \
   lucasarguerra/redes2-sensor:latest python sensor.py setor_a
+
+# Cliente manual (-it obrigatório para input interativo)
+docker run -it --network host \
+  -e BROKER_A=<IP_A>:7001 -e BROKER_B=<IP_B>:7002 -e BROKER_C=<IP_C>:7003 \
+  lucasarguerra/redes2-cliente:latest python cliente.py setor_a
 ```
 
 Para ver os logs de um container rodando em background:
@@ -257,6 +302,8 @@ Envia N requisições em ordem aleatória para setores aleatórios e imprime a o
 
 ```bash
 python teste_carga.py 20
+# ou via Docker (-it para input interativo)
+docker run -it --network host lucasarguerra/redes2-testes:latest python teste_carga.py 20
 ```
 
 ### `teste_consistencia.py` — consistência entre brokers
@@ -265,12 +312,14 @@ Envia N requisições, aguarda propagação e imprime a distribuição esperada 
 
 ```bash
 python teste_consistencia.py 15
+docker run -it --network host lucasarguerra/redes2-testes:latest python teste_consistencia.py 15
 ```
 
 ### `teste_falhas.py` — condições críticas (menu interativo)
 
 ```bash
 python teste_falhas.py
+docker run -it --network host lucasarguerra/redes2-testes:latest python teste_falhas.py
 ```
 
 Oferece quatro cenários:
@@ -298,8 +347,12 @@ Oferece quatro cenários:
 ├── sensor/
 │   ├── sensor.py           # Gerador de ocorrências aleatórias
 │   └── Dockerfile
+├── cliente/
+│   ├── cliente.py          # Interface manual para envio de ocorrências
+│   └── Dockerfile
 └── testes/
     ├── teste_carga.py        # Teste de ordenação por prioridade
     ├── teste_consistencia.py # Teste de replicação da fila entre brokers
-    └── teste_falhas.py       # Testes de condições críticas (menu interativo)
+    ├── teste_falhas.py       # Testes de condições críticas (menu interativo)
+    └── Dockerfile
 ```
